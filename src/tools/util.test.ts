@@ -1,0 +1,209 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import {
+  DEFAULT_PAGE_LIMIT,
+  buildPage,
+  adId,
+  compact,
+  fail,
+  isoDate,
+  normalizeMoney,
+  ok,
+  okOrPartial,
+  toMicros,
+} from "./util.js";
+import { toolOutcome } from "../telemetry.js";
+
+function textOf(result: CallToolResult): string {
+  return result.content.map((c) => ("text" in c ? c.text : "")).join("");
+}
+
+test("ok() emits valid text content even when data is undefined", () => {
+  // Regression: JSON.stringify(undefined) is undefined, which produced
+  // {type:"text", text: undefined} → rejected by the MCP SDK as invalid content.
+  const result = ok(undefined);
+  assert.equal(result.content[0].type, "text");
+  assert.equal(textOf(result), "null");
+});
+
+test("fail() appends the cause message of a wrapped fetch error", () => {
+  // Node's fetch reports "fetch failed" and hides the real error in `cause`.
+  const err = new Error("fetch failed", { cause: new Error("connect ECONNREFUSED 1.2.3.4:443") });
+  const result = fail(err);
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /fetch failed \(причина: connect ECONNREFUSED 1\.2\.3\.4:443\)/);
+});
+
+test("fail() leaves messages without a cause untouched and stringifies non-Errors", () => {
+  assert.equal(textOf(fail(new Error("plain"))), "Ошибка: plain");
+  assert.equal(textOf(fail("строка")), "Ошибка: строка");
+  // A non-Error cause (e.g. a string) is ignored rather than blindly stringified.
+  const withOddCause = new Error("outer", { cause: "just a string" });
+  assert.equal(textOf(fail(withOddCause)), "Ошибка: outer");
+});
+
+test("okOrPartial reports success when every object has an Id", () => {
+  const result = okOrPartial({ AddResults: [{ Id: 1 }, { Id: 2 }] });
+  assert.equal(result.isError, undefined);
+  assert.match(textOf(result), /"Id":1/);
+});
+
+test("okOrPartial flags a partial failure as an error", () => {
+  const result = okOrPartial({
+    AddResults: [
+      { Id: 1 },
+      { Errors: [{ Code: 5006, Message: "Object not found", Details: "AdGroupId 1" }] },
+    ],
+  });
+  assert.equal(result.isError, true);
+  const text = textOf(result);
+  assert.match(text, /Ошибки в 1 из 2 объектов/);
+  assert.match(text, /\[5006\] Object not found: AdGroupId 1/);
+  // the full payload is still included for context
+  assert.match(text, /"Id":1/);
+});
+
+test("okOrPartial flags an all-failed action response", () => {
+  const result = okOrPartial({
+    ActionResults: [{ Errors: [{ Code: 8800, Message: "No rights" }] }],
+  });
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /Ошибки во всех объектах \(1\)/);
+});
+
+test("okOrPartial ignores arrays that are not *Results", () => {
+  const result = okOrPartial({ Campaigns: [{ Id: 1, Errors: [{ Message: "x" }] }] });
+  assert.equal(result.isError, undefined);
+});
+
+test("okOrPartial lists warnings without flagging an error", () => {
+  const result = okOrPartial({
+    AddResults: [
+      {
+        Id: 42,
+        Warnings: [
+          { Code: 10170, Message: "Поле Title2 объединено с полем Title" },
+          { Code: 10120, Message: "Параметр не будет применен", Details: "Mobile" },
+        ],
+      },
+    ],
+  });
+  assert.equal(result.isError, undefined);
+  assert.equal(toolOutcome(result), "ok");
+  assert.equal(
+    textOf(result),
+    "Предупреждения API (2), операция выполнена с оговорками:\n" +
+      "- Id 42: [10170] Поле Title2 объединено с полем Title\n" +
+      "- Id 42: [10120] Параметр не будет применен: Mobile\n\n" +
+      '{"AddResults":[{"Id":42,"Warnings":[{"Code":10170,"Message":"Поле Title2 объединено с полем Title"},' +
+      '{"Code":10120,"Message":"Параметр не будет применен","Details":"Mobile"}]}]}',
+  );
+});
+
+test("okOrPartial shows both errors and warnings on a partial failure", () => {
+  const result = okOrPartial({
+    UpdateResults: [
+      { Id: 1, Warnings: [{ Message: "Ставка не будет применена" }] },
+      { Errors: [{ Code: 8800, Message: "Object not found" }], Warnings: [{ Code: 10000 }] },
+    ],
+  });
+  assert.equal(result.isError, true);
+  const text = textOf(result);
+  assert.ok(
+    text.startsWith(
+      "Ошибки в 1 из 2 объектов:\n- [8800] Object not found\n\n" +
+        "Предупреждения API (2), операция выполнена с оговорками:\n" +
+        "- Id 1: Ставка не будет применена\n" +
+        "- объект 2: [10000] Предупреждение без текста\n\n{",
+    ),
+    text,
+  );
+});
+
+test("okOrPartial output is unchanged without errors and warnings", () => {
+  const payload = { AddResults: [{ Id: 1 }, { Id: 2, Warnings: [] }] };
+  assert.deepEqual(okOrPartial(payload), { content: [{ type: "text", text: JSON.stringify(payload) }] });
+  assert.deepEqual(okOrPartial("raw"), { content: [{ type: "text", text: "raw" }] });
+});
+
+test("compact drops only undefined values, keeping null/0/empty", () => {
+  assert.deepEqual(compact({ a: 1, b: undefined, c: null, d: 0, e: "" }), {
+    a: 1,
+    c: null,
+    d: 0,
+    e: "",
+  });
+});
+
+test("isoDate accepts YYYY-MM-DD and rejects other formats", () => {
+  const d = isoDate(); // factory → fresh schema
+  assert.equal(d.safeParse("2026-06-15").success, true);
+  assert.equal(d.safeParse("2026-6-15").success, false);
+  assert.equal(d.safeParse("15.06.2026").success, false);
+  assert.equal(d.safeParse("yesterday").success, false);
+});
+
+test("buildPage defaults Limit/Offset and skips when nothing is requested", () => {
+  assert.equal(buildPage(undefined, undefined), undefined);
+  assert.deepEqual(buildPage(50, 10), { Limit: 50, Offset: 10 });
+  assert.deepEqual(buildPage(undefined, 20), { Limit: DEFAULT_PAGE_LIMIT, Offset: 20 });
+  assert.deepEqual(buildPage(50, undefined), { Limit: 50, Offset: 0 });
+});
+
+test("toMicros rounds currency units to integer micros", () => {
+  assert.equal(toMicros(0.3), 300000);
+  assert.equal(toMicros(12.34), 12340000);
+});
+
+test("normalizeMoney converts keyword bids from micros to units", () => {
+  const result = normalizeMoney({
+    Keywords: [{ Id: 1, Keyword: "x", Bid: 300000, ContextBid: 12340000 }],
+  });
+  assert.deepEqual(result.Keywords[0], { Id: 1, Keyword: "x", Bid: 0.3, ContextBid: 12.34 });
+});
+
+test("normalizeMoney converts shared-account Funds money fields from micros", () => {
+  const result = normalizeMoney({
+    Campaigns: [
+      {
+        Id: 7,
+        Funds: {
+          Mode: "CAMPAIGN_FUNDS",
+          CampaignFunds: { Sum: 5_000_000, Balance: 3_000_000, SumAvailableForTransfer: 1_000_000 },
+          SharedAccountFunds: { Spend: 2_000_000 },
+        },
+      },
+    ],
+  });
+  const funds = result.Campaigns[0].Funds;
+  assert.equal(funds.CampaignFunds.Sum, 5);
+  assert.equal(funds.CampaignFunds.Balance, 3);
+  assert.equal(funds.CampaignFunds.SumAvailableForTransfer, 1);
+  assert.equal(funds.SharedAccountFunds.Spend, 2);
+  assert.equal(funds.Mode, "CAMPAIGN_FUNDS"); // non-money strings untouched
+});
+
+test("normalizeMoney leaves null, ids and unknown keys alone", () => {
+  const result = normalizeMoney({
+    Campaigns: [
+      { Id: 7, Funds: null },
+      { Id: 8, Amount: 1_000_000 },
+    ],
+  });
+  assert.equal(result.Campaigns[0].Funds, null);
+  assert.equal(result.Campaigns[0].Id, 7);
+  assert.equal(result.Campaigns[1].Amount, 1_000_000, "Amount is not a v5 money key anymore");
+});
+
+test("adId takes a number or a string of digits and refuses a number that lost precision", () => {
+  const schema = adId();
+  assert.equal(schema.parse(17674525094), 17674525094);
+  assert.equal(schema.parse("1926766869946816190"), "1926766869946816190");
+  // 1926766869946816190 written as a number is already 1926766869946816300: another ad.
+  const rounded = schema.safeParse(1926766869946816190);
+  assert.equal(rounded.success, false);
+  assert.match(JSON.stringify(rounded.error?.issues), /строкой/);
+  assert.equal(schema.safeParse("12a").success, false);
+  assert.equal(schema.safeParse(1.5).success, false);
+});

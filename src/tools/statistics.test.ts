@@ -1,0 +1,474 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { z } from "zod";
+import { DEFAULT_FIELDS_BY_TYPE, registerStatisticsTools, REPORT_FIELDS, REPORT_TYPES } from "./statistics.js";
+import { aggregateReport, truncateTsv } from "./statistics.aggregate.js";
+import { YandexDirectClient } from "../client.js";
+
+type Args = Record<string, unknown>;
+type Handler = (args: Args) => Promise<{ content: { text: string }[]; isError?: boolean }>;
+
+/** Registers the statistics tool against a fake server + client whose report() is stubbable. */
+function harness(reportImpl?: (params: any) => string) {
+  const calls: any[] = [];
+  const tools: Record<string, Handler> = {};
+  const client = {
+    report: async (params: any) => {
+      calls.push(params);
+      return reportImpl ? reportImpl(params) : "";
+    },
+  };
+  const server = {
+    registerTool: (name: string, _cfg: unknown, handler: Handler) => {
+      tools[name] = handler;
+    },
+  };
+  registerStatisticsTools(server as never, client as never);
+  return { calls, tools };
+}
+
+const CAMPAIGN_HEADER = "CampaignId\tCampaignName\tImpressions\tClicks\tCost\tCtr\tAvgCpc";
+
+const SQ_FIELDS = ["Query", "Impressions", "Clicks", "Cost", "Conversions"];
+// аудио: conv(26) > clicks(20) → anomaly; mp3: clicks>0 & 0 conv → zeroConversion;
+// мусор: 0 clicks → zeroClick.
+const SQ_TSV = [
+  "аудио в текст\t100\t20\t160.00\t26",
+  "whisper\t50\t10\t90.00\t8",
+  "mp3 в текст\t30\t3\t27.00\t0",
+  "мусор\t40\t0\t0\t0",
+].join("\n");
+
+test("every report type has a default field set", () => {
+  for (const type of REPORT_TYPES) {
+    assert.ok(DEFAULT_FIELDS_BY_TYPE[type]?.length, `${type} has defaults`);
+  }
+});
+
+test("ACCOUNT_PERFORMANCE_REPORT defaults exclude fields the API rejects for it", () => {
+  const fields = DEFAULT_FIELDS_BY_TYPE.ACCOUNT_PERFORMANCE_REPORT;
+  for (const forbidden of ["CampaignName", "CampaignId", "AdGroupName", "AdId", "CriterionId"]) {
+    assert.ok(!fields.includes(forbidden), `${forbidden} must not be a default`);
+  }
+});
+
+test("defaults exclude Date so reports aggregate over the period (LD)", () => {
+  for (const type of REPORT_TYPES) {
+    assert.ok(
+      !DEFAULT_FIELDS_BY_TYPE[type].includes("Date"),
+      `${type} default must not include Date (would split the report by day)`,
+    );
+  }
+});
+
+test("SEARCH_QUERY default is the period aggregate: CampaignName + Query + metrics", () => {
+  assert.deepEqual(DEFAULT_FIELDS_BY_TYPE.SEARCH_QUERY_PERFORMANCE_REPORT, [
+    "CampaignName",
+    "Query",
+    "Impressions",
+    "Clicks",
+    "Cost",
+    "Ctr",
+    "AvgCpc",
+  ]);
+});
+
+// ---- L2 aggregation ----
+
+test("aggregate: totals are over 100% of rows (true period total)", () => {
+  const a = aggregateReport(SQ_TSV, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.rowsTotal, 4);
+  assert.equal(a.totals.Impressions, 220);
+  assert.equal(a.totals.Clicks, 33);
+  assert.equal(a.totals.Cost, 277);
+  assert.equal(a.totals.Conversions, 34);
+  assert.equal(a.counts.zeroClick, 1); // мусор
+  assert.equal(a.counts.zeroConversion, 1); // mp3 в текст
+});
+
+test("aggregate: top sorted by Cost desc with 95% adaptive cutoff; tail = rest", () => {
+  const a = aggregateReport(SQ_TSV, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  // cumulative cost reaches 95% at row 3 (160+90+27 = 277 of 277) → 3 shown, 1 in tail.
+  assert.equal(a.top.length, 3);
+  assert.equal(a.top[0].Query, "аудио в текст");
+  assert.equal(a.tail.rows, 1);
+  // top + tail reconstruct the full set.
+  const topCost = a.top.reduce((s, r) => s + Number(r.Cost), 0);
+  assert.equal(Math.round((topCost + a.tail.Cost) * 100) / 100, a.totals.Cost);
+});
+
+test("aggregate: conversions>clicks anomaly is flagged", () => {
+  const a = aggregateReport(SQ_TSV, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.anomalies?.length, 1);
+  assert.equal(a.anomalies?.[0].Query, "аудио в текст");
+});
+
+test("aggregate: field-aware — no Conversions in fieldNames omits conversion data", () => {
+  const fields = ["Query", "Impressions", "Clicks", "Cost"];
+  const tsv = SQ_TSV.split("\n").map((l) => l.split("\t").slice(0, 4).join("\t")).join("\n");
+  const a = aggregateReport(tsv, fields, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.hasConversions, false);
+  assert.equal(a.counts.zeroConversion, undefined);
+  assert.equal(a.anomalies, undefined);
+  assert.equal("Conversions" in a.totals, false);
+  assert.equal("Conversions" in a.top[0], false);
+});
+
+test("aggregate: Revenue/Profit are summed money metrics, not dimension strings", () => {
+  const fields = ["Query", "Clicks", "Cost", "Revenue", "Profit"];
+  const tsv = ["a\t10\t100.10\t300.20\t200.10", "b\t5\t50.20\t0.10\t-50.10"].join("\n");
+  const a = aggregateReport(tsv, fields, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.totals.Revenue, 300.3);
+  assert.equal(a.totals.Profit, 150);
+  assert.equal(a.top[0].Revenue, 300.2);
+  assert.equal(a.top[0].Query, "a");
+});
+
+test("aggregate: filters drive the detail list; totals stay over 100%", () => {
+  const a = aggregateReport(SQ_TSV, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT", { minCost: 50 });
+  assert.equal(a.totals.Cost, 277); // unchanged — totals are over all rows
+  assert.equal(a.filtered?.rows, 2); // only аудио + whisper survive minCost:50
+  assert.ok(a.top.every((r) => Number(r.Cost) >= 50));
+});
+
+test("aggregate: zeroClicksOnly filter", () => {
+  const a = aggregateReport(SQ_TSV, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT", {
+    zeroClicksOnly: true,
+  });
+  assert.equal(a.filtered?.rows, 1);
+  assert.equal(a.top[0].Query, "мусор");
+});
+
+// ---- column-header stripping (the live Reports TSV keeps the header row) ----
+
+test("aggregate: leading column-header row is dropped, not counted as data", () => {
+  // The live Reports service returns the column header as the first TSV line.
+  const withHeader = [SQ_FIELDS.join("\t"), SQ_TSV].join("\n");
+  const a = aggregateReport(withHeader, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  // Identical to the headerless fixture — the header must not become a phantom row.
+  assert.equal(a.rowsTotal, 4);
+  assert.equal(a.counts.zeroClick, 1); // not 2 — header is not a zero-click row
+  assert.equal(a.totals.Cost, 277);
+  assert.ok(!a.top.some((r) => r.Query === "Query"), "header must not leak into top rows");
+});
+
+test("aggregate: empty slice (header-only TSV) → 0 rows with an explicit empty note", () => {
+  // No traffic in the slice → the report body is just the column header.
+  const a = aggregateReport(SQ_FIELDS.join("\t"), SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.rowsTotal, 0);
+  assert.equal(a.totals.Cost, 0);
+  assert.equal(a.top.length, 0);
+  assert.match(a.note, /0 строк в этом срезе/);
+  assert.match(a.note, /а не отчёт недоступен/);
+});
+
+test("aggregate: a real query literally equal to a field name is not mistaken for a header", () => {
+  // First data line whose first cell is "Query" but other cells are numbers — not a header.
+  const tsv = ["Query\t10\t2\t5.00\t0", "whisper\t50\t10\t90.00\t8"].join("\n");
+  const a = aggregateReport(tsv, SQ_FIELDS, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.rowsTotal, 2);
+  assert.equal(a.totals.Clicks, 12);
+});
+
+test("aggregate: zeroConversionsOnly without Conversions in fieldNames throws a clear error", () => {
+  const fields = ["Query", "Impressions", "Clicks", "Cost"];
+  assert.throws(
+    () =>
+      aggregateReport("audio\t100\t20\t160.00", fields, "SEARCH_QUERY_PERFORMANCE_REPORT", {
+        zeroConversionsOnly: true,
+      }),
+    /Conversions/,
+  );
+});
+
+// ---- raw-TSV size caps ----
+
+const CAMPAIGN_FIELDS = ["CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Ctr", "AvgCpc"];
+
+test("truncateTsv returns the text untouched when it fits the caps", () => {
+  const tsv = `${CAMPAIGN_HEADER}\n1\tA\t10\t2\t5\t20\t2.5\n2\tB\t20\t4\t9\t20\t2.2`;
+  const cut = truncateTsv(tsv, CAMPAIGN_FIELDS);
+  assert.equal(cut.truncated, false);
+  assert.equal(cut.text, tsv);
+  assert.equal(cut.totalRows, 2);
+  assert.equal(cut.shownRows, 2);
+});
+
+test("truncateTsv cuts at the row cap, keeps the header, counts total rows", () => {
+  const rows = Array.from({ length: 5 }, (_, i) => `${i}\tC${i}\t10\t2\t5\t20\t2.5`);
+  const cut = truncateTsv([CAMPAIGN_HEADER, ...rows].join("\n"), CAMPAIGN_FIELDS, 3);
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.shownRows, 3);
+  assert.equal(cut.totalRows, 5);
+  const lines = cut.text.split("\n");
+  assert.equal(lines[0], CAMPAIGN_HEADER); // header preserved, not counted as a row
+  assert.equal(lines.length, 4);
+});
+
+test("truncateTsv cuts at the byte cap", () => {
+  const rows = Array.from({ length: 10 }, (_, i) => `${i}\tC${i}\t10\t2\t5\t20\t2.5`);
+  const oneRowBytes = rows[0].length + 1;
+  const cut = truncateTsv(rows.join("\n"), CAMPAIGN_FIELDS, 100_000, oneRowBytes * 2);
+  assert.equal(cut.truncated, true);
+  assert.ok(cut.shownRows < 10);
+  assert.equal(cut.totalRows, 10);
+});
+
+test("get_statistics appends a loud note when the raw TSV exceeds the byte cap", async () => {
+  // ~60k rows × ~20 bytes ≈ 1.2 MB > REPORT_MAX_BYTES — the handler must cut and say so.
+  const bigTsv = [
+    CAMPAIGN_HEADER,
+    ...Array.from({ length: 60_000 }, (_, i) => `${i}\tA\t10\t2\t5\t20\t2.5`),
+  ].join("\n");
+  const { tools } = harness(() => bigTsv);
+  const res = await tools.get_statistics({});
+  assert.equal(res.isError, undefined);
+  assert.match(res.content[0].text, /\[_truncated\]/);
+  assert.match(res.content[0].text, /из 60000/);
+  assert.ok(res.content[0].text.length < bigTsv.length);
+});
+
+// ---- get_statistics handler: date-range and empty-slice guards ----
+
+test("get_statistics rejects a single date bound and makes no report request", async () => {
+  const { calls, tools } = harness();
+  const res = await tools.get_statistics({ dateFrom: "2026-01-01" });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /обе даты — dateFrom и dateTo/);
+  assert.equal(calls.length, 0);
+});
+
+test("get_statistics forces CUSTOM_DATE when both dates accompany a predefined range", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tA\t10\t2\t5\t20\t2.5\n`);
+  const res = await tools.get_statistics({
+    dateRangeType: "LAST_7_DAYS",
+    dateFrom: "2026-01-01",
+    dateTo: "2026-01-31",
+  });
+  assert.equal(res.isError, undefined);
+  // The explicit date pair wins over LAST_7_DAYS instead of being silently ignored.
+  assert.equal(calls[0].DateRangeType, "CUSTOM_DATE");
+  assert.equal(calls[0].SelectionCriteria.DateFrom, "2026-01-01");
+  assert.equal(calls[0].SelectionCriteria.DateTo, "2026-01-31");
+});
+
+test("get_statistics answers a header-only report (0 data rows) with an empty-slice note", async () => {
+  // Live Reports always echoes the column header, so tsv.trim() is never empty — the guard
+  // must count DATA rows, not test for an empty string. The empty slice is a SUCCESS with
+  // an explicit note (not isError): a paused campaign legitimately yields 0 rows.
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n`);
+  const res = await tools.get_statistics({ campaignIds: [999] });
+  assert.equal(res.isError, undefined);
+  assert.match(res.content[0].text, /0 строк для campaignIds \[999\]/);
+  assert.match(res.content[0].text, /не расширять фильтр вслепую/);
+  assert.equal(calls.length, 1); // the report WAS requested; the note is post-hoc
+});
+
+test("get_statistics returns the raw TSV when a campaign filter has data rows", async () => {
+  const { tools } = harness(() => `${CAMPAIGN_HEADER}\n123\tMy campaign\t100\t20\t50.00\t20\t2.5\n`);
+  const res = await tools.get_statistics({ campaignIds: [123] });
+  assert.equal(res.isError, undefined);
+  assert.match(res.content[0].text, /My campaign/);
+});
+
+// --- goals / attribution / arbitrary filters / CUSTOM_REPORT ----------------
+
+test("goals and attributionModels ride NEXT TO SelectionCriteria, not inside it", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  await tools.get_statistics({
+    fieldNames: ["CampaignName", "Cost", "Revenue", "Conversions"],
+    goals: ["20002", "20003"],
+    attributionModels: ["LSCCD"],
+  });
+  assert.deepEqual(calls[0].Goals, ["20002", "20003"]);
+  assert.deepEqual(calls[0].AttributionModels, ["LSCCD"]);
+  assert.equal(calls[0].SelectionCriteria.Goals, undefined, "Goals must not be nested in SelectionCriteria");
+  assert.ok(calls[0].FieldNames.includes("Revenue"));
+});
+
+test("omitting goals sends neither Goals nor AttributionModels", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  await tools.get_statistics({});
+  assert.equal("Goals" in calls[0], false);
+  assert.equal("AttributionModels" in calls[0], false);
+});
+
+test("attributionModels without goals are not sent (API code 4000)", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  const res = await tools.get_statistics({ attributionModels: ["LC"] });
+  assert.equal(res.isError ?? false, false);
+  assert.equal("AttributionModels" in calls[0], false);
+});
+
+test("arbitrary filters are ANDed with the campaignIds shorthand", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  await tools.get_statistics({
+    campaignIds: [123],
+    filters: [{ field: "Clicks", operator: "GREATER_THAN", values: ["0"] }],
+  });
+  assert.deepEqual(calls[0].SelectionCriteria.Filter, [
+    { Field: "CampaignId", Operator: "IN", Values: ["123"] },
+    { Field: "Clicks", Operator: "GREATER_THAN", Values: ["0"] },
+  ]);
+});
+
+test("filters alone (no campaignIds) still build a Filter array", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  await tools.get_statistics({
+    filters: [{ field: "Device", operator: "EQUALS", values: ["MOBILE"] }],
+  });
+  assert.deepEqual(calls[0].SelectionCriteria.Filter, [
+    { Field: "Device", Operator: "EQUALS", Values: ["MOBILE"] },
+  ]);
+});
+
+test("no filters at all leaves SelectionCriteria without a Filter key", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  await tools.get_statistics({});
+  assert.equal("Filter" in calls[0].SelectionCriteria, false);
+});
+
+test("CUSTOM_REPORT passes caller-chosen dimensions straight through", async () => {
+  const header = "Device\tCost\tClicks";
+  const { calls, tools } = harness(() => `${header}\nMOBILE\t100.00\t20\n`);
+  const res = await tools.get_statistics({
+    reportType: "CUSTOM_REPORT",
+    fieldNames: ["Device", "Cost", "Clicks"],
+  });
+  assert.equal(calls[0].ReportType, "CUSTOM_REPORT");
+  assert.deepEqual(calls[0].FieldNames, ["Device", "Cost", "Clicks"]);
+  assert.match(res.content[0].text, /MOBILE/);
+});
+
+test("the extended DateRangeType list reaches the API unchanged", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n1\tC\t1\t1\t1\t1\t1\n`);
+  await tools.get_statistics({ dateRangeType: "LAST_3_DAYS" });
+  assert.equal(calls[0].DateRangeType, "LAST_3_DAYS");
+});
+
+test("search-query summary refuses several goal × model columns before the request", async () => {
+  const { calls, tools } = harness();
+  const res = await tools.get_statistics({
+    reportType: "SEARCH_QUERY_PERFORMANCE_REPORT",
+    fieldNames: ["Query", "Clicks", "Cost", "Conversions"],
+    goals: ["1", "2"],
+  });
+  assert.equal(res.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("search-query summary with one goal maps suffixed columns and drops their header", async () => {
+  const fields = ["Query", "Clicks", "Cost", "Conversions", "Revenue"];
+  const tsv = [
+    "Query\tClicks\tCost\tConversions_42_LC\tRevenue_42_LC",
+    "a\t10\t100.00\t2\t300.00",
+  ].join("\n");
+  const { tools } = harness(() => tsv);
+  const res = await tools.get_statistics({
+    reportType: "SEARCH_QUERY_PERFORMANCE_REPORT",
+    fieldNames: fields,
+    goals: ["42"],
+  });
+  const a = JSON.parse(res.content[0].text);
+  assert.equal(a.rowsTotal, 1);
+  assert.equal(a.totals.Conversions, 2);
+  assert.equal(a.totals.Revenue, 300);
+});
+
+test("raw report with goals keeps the widened header out of the row count", () => {
+  const fields = ["CampaignId", "Conversions"];
+  const tsv = "CampaignId\tConversions_1_LC\tConversions_2_LC\n7\t1\t2\n";
+  const cut = truncateTsv(tsv, fields, 10);
+  assert.equal(cut.totalRows, 1);
+});
+
+test("money filters take account currency and reach Reports in micros", async () => {
+  const { calls, tools } = harness(() => `${CAMPAIGN_HEADER}\n`);
+  await tools.get_statistics({
+    filters: [
+      { field: "Cost", operator: "GREATER_THAN", values: ["100.5"] },
+      { field: "Clicks", operator: "GREATER_THAN", values: ["3"] },
+    ],
+  });
+  assert.deepEqual(calls[0].SelectionCriteria.Filter, [
+    { Field: "Cost", Operator: "GREATER_THAN", Values: ["100500000"] },
+    { Field: "Clicks", Operator: "GREATER_THAN", Values: ["3"] },
+  ]);
+});
+
+test("a non-numeric money filter is refused before the request", async () => {
+  const { calls, tools } = harness();
+  const res = await tools.get_statistics({
+    filters: [{ field: "Cost", operator: "GREATER_THAN", values: ["много"] }],
+  });
+  assert.equal(res.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("ALL_TIME search-query report is allowed when filters bound it to campaigns", async () => {
+  const { calls, tools } = harness(() => "");
+  const res = await tools.get_statistics({
+    reportType: "SEARCH_QUERY_PERFORMANCE_REPORT",
+    dateRangeType: "ALL_TIME",
+    filters: [{ field: "CampaignId", operator: "IN", values: ["123"] }],
+  });
+  assert.notEqual(res.isError, true);
+  assert.equal(calls.length, 1);
+});
+
+test("aggregate: GoalsRoi is a numeric metric, not summed", () => {
+  const fields = ["Query", "Cost", "GoalsRoi"];
+  const a = aggregateReport("a\t100\t2.5\nb\t50\t-0.5", fields, "SEARCH_QUERY_PERFORMANCE_REPORT");
+  assert.equal(a.top[0].GoalsRoi, 2.5);
+  assert.equal("GoalsRoi" in a.totals, false);
+});
+
+test("two reports requested in the same millisecond get different ReportNames", async () => {
+  const { calls, tools } = harness(() => "");
+  const realNow = Date.now;
+  Date.now = () => 1_700_000_000_000;
+  try {
+    await Promise.all([
+      tools.get_statistics({ dateRangeType: "LAST_7_DAYS" }),
+      tools.get_statistics({ dateRangeType: "LAST_30_DAYS" }),
+    ]);
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[0].ReportName, calls[1].ReportName);
+});
+
+test("every poll of one offline report resends the same ReportName", async () => {
+  const original = globalThis.fetch;
+  const names: string[] = [];
+  globalThis.fetch = (async (_url: unknown, init: RequestInit) => {
+    names.push(JSON.parse(String(init.body)).params.ReportName);
+    return names.length < 3
+      ? new Response("", { status: 201, headers: { retryIn: "0" } })
+      : new Response("CampaignId\tClicks\n1\t2\n", { status: 200 });
+  }) as typeof fetch;
+  try {
+    const tools: Record<string, Handler> = {};
+    const server = { registerTool: (name: string, _cfg: unknown, h: Handler) => (tools[name] = h) };
+    const client = new YandexDirectClient({ token: "T", lang: "ru", sandbox: true });
+    registerStatisticsTools(server as never, client);
+    const res = await tools.get_statistics({ fieldNames: ["CampaignId", "Clicks"] });
+    assert.notEqual(res.isError, true);
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(names.length, 3);
+  assert.equal(new Set(names).size, 1);
+});
+
+test("fieldNames accepts only Reports field names, defaults included", () => {
+  let schema: Record<string, z.ZodTypeAny> = {};
+  const server = { registerTool: (_n: string, cfg: { inputSchema: Record<string, z.ZodTypeAny> }) => { schema = cfg.inputSchema; } };
+  registerStatisticsTools(server as never, {} as never);
+  const fieldNames = schema.fieldNames;
+  for (const type of REPORT_TYPES) assert.ok(fieldNames.safeParse(DEFAULT_FIELDS_BY_TYPE[type]).success, type);
+  assert.ok(fieldNames.safeParse([...REPORT_FIELDS]).success);
+  assert.ok(!fieldNames.safeParse(["CampaignId", "Conversion"]).success);
+  assert.ok(!fieldNames.safeParse(["Keyword"]).success, "Keyword is a filter field, not a column");
+});

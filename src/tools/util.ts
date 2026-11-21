@@ -1,0 +1,318 @@
+import { createHash } from "node:crypto";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+import { YandexDirectError } from "../types.js";
+import { noteFailure } from "../telemetry.js";
+import { currentClientLogin } from "../clientLogin.js";
+
+/**
+ * A date in YYYY-MM-DD form, validated before the request reaches the API.
+ *
+ * A FACTORY (not a shared const): reusing one zod object across fields makes
+ * zod-to-json-schema dedupe them into a `$ref` (e.g. dateTo → #/properties/dateFrom),
+ * which some tool-schema consumers (OpenAI Apps review) don't dereference and flag
+ * as `any`. A fresh object per field keeps each one inlined with its type+pattern.
+ */
+export const isoDate = () =>
+  z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Дата должна быть в формате YYYY-MM-DD");
+
+/**
+ * ReportName for a report request, derived from its params: the same request within the same
+ * UTC hour gets the same name. Reports treats "same name, same params" as the same report, so a
+ * call repeated after "отчёт не был готов" picks up the report still queued offline instead of
+ * queueing one more — with a random name each retry added a report until the queue overflowed
+ * (code 9000, "5–6 отчетов ожидают формирования"). Other params give another hash, so code 4000
+ * ("name reused with other params") cannot happen. The hour bucket bounds how stale a reused
+ * ready report can be for relative ranges (TODAY, LAST_7_DAYS). Client-Login is hashed in so two
+ * advertisers never share a name. Built once per request, so every poll resends it.
+ */
+export function reportName(prefix: string, params: object, now: Date = new Date()): string {
+  const hour = now.toISOString().slice(0, 13).replace(/\D/g, "");
+  const hash = createHash("sha256")
+    .update(JSON.stringify([currentClientLogin() ?? "", params]))
+    .digest("hex")
+    .slice(0, 12);
+  return `${prefix}-${hour}-${hash}`;
+}
+
+/**
+ * An ad id as a tool parameter: a number, or a string of digits for the ids a number cannot
+ * hold. Ads added since Direct made them комбинаторные carry 64-bit ids, which the client
+ * returns as strings (see lossless.ts) and Direct accepts back as strings (checked live
+ * 2026-11-12: ads.get, ads.update, ads.suspend). A number past 2^53 was already rounded by
+ * whoever serialized it, so it is refused here instead of being sent to hit 8800 «Объект не
+ * найден» — or, worse, another ad. A factory for the same reason as isoDate.
+ */
+export const adId = () =>
+  z.union([
+    z
+      .number()
+      .int()
+      .refine(Number.isSafeInteger, {
+        message:
+          "Id длиннее 15 цифр нельзя передавать числом — оно теряет точность. Передать id строкой, как он пришёл в ответе (например \"1926766869946816190\").",
+      }),
+    z.string().regex(/^\d+$/, "Id — число или строка из цифр"),
+  ]);
+
+/**
+ * Appended to the description of every tool that talks to a service routed to v501 by
+ * default (client.ts, V501_DEFAULT_SERVICES): the version a request goes to is part of what
+ * the tool does, so the consuming model is told, sandbox exception included.
+ */
+export const V501_ROUTE_NOTE = "Запрос идёт в API v501, в песочнице — в v5.";
+
+/** Appended to the description of every parameter that takes ad ids. */
+export const AD_ID_HINT = "Длинный id (приходит в ответах строкой) передавать строкой как есть.";
+
+export function ok(data: unknown): CallToolResult {
+  // Compact JSON (no indent): the consumer is an LLM, pretty-printing only burns tokens.
+  // `JSON.stringify(undefined)` is `undefined` (not a string) — guard it so we never emit
+  // `{type:"text", text: undefined}`, which the MCP SDK rejects as invalid content.
+  const text = typeof data === "string" ? data : JSON.stringify(data) ?? "null";
+  return { content: [{ type: "text", text }] };
+}
+
+interface ObjectError {
+  Code?: number;
+  Message?: string;
+  Details?: string;
+}
+
+function formatNotification(err: ObjectError, fallback: string): string {
+  const code = err?.Code !== undefined ? `[${err.Code}] ` : "";
+  const message = err?.Message ?? fallback;
+  const details = err?.Details ? `: ${err.Details}` : "";
+  return `${code}${message}${details}`;
+}
+
+/**
+ * Scans a write response for per-object outcomes. The Yandex Direct JSON API
+ * returns HTTP 200 with the outcome of each object in an `*Results` array
+ * (AddResults, UpdateResults, DeleteResults, ActionResults, SetResults, ...);
+ * a failed object carries a non-empty `Errors` array while the request as a
+ * whole still "succeeds". `Warnings` mean the object was saved, but not exactly
+ * as sent (a parameter ignored, a field merged, the ad type changed).
+ */
+function collectObjectNotifications(result: unknown): {
+  failed: number;
+  total: number;
+  messages: string[];
+  warnings: string[];
+} {
+  const out = { failed: 0, total: 0, messages: [] as string[], warnings: [] as string[] };
+  if (!result || typeof result !== "object") return out;
+  for (const [key, value] of Object.entries(result as Record<string, unknown>)) {
+    if (!key.endsWith("Results") || !Array.isArray(value)) continue;
+    for (const [index, item] of value.entries()) {
+      out.total++;
+      const { Errors: errors, Warnings: warnings, Id: id } =
+        (item ?? {}) as { Errors?: unknown; Warnings?: unknown; Id?: unknown };
+      if (Array.isArray(errors) && errors.length > 0) {
+        out.failed++;
+        for (const err of errors as ObjectError[]) {
+          out.messages.push(formatNotification(err, "Неизвестная ошибка"));
+        }
+      }
+      if (Array.isArray(warnings) && warnings.length > 0) {
+        const where = typeof id === "number" || typeof id === "string" ? `Id ${id}` : `объект ${index + 1}`;
+        for (const warn of warnings as ObjectError[]) {
+          out.warnings.push(`${where}: ${formatNotification(warn, "Предупреждение без текста")}`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Like {@link ok}, but inspects per-object `*Results` arrays and flags the
+ * response as an error when any object failed — so partial failures are not
+ * silently reported as success. Warnings are listed before the payload but do
+ * not set `isError`: the objects were saved.
+ */
+export function okOrPartial(result: unknown): CallToolResult {
+  const { failed, total, messages, warnings } = collectObjectNotifications(result);
+  const body = typeof result === "string" ? result : JSON.stringify(result) ?? "null";
+  const blocks: string[] = [];
+  if (failed > 0) {
+    const header =
+      failed === total
+        ? `Ошибки во всех объектах (${total}):`
+        : `Ошибки в ${failed} из ${total} объектов:`;
+    blocks.push(`${header}\n${messages.map((m) => `- ${m}`).join("\n")}`);
+  }
+  if (warnings.length > 0) {
+    blocks.push(
+      `Предупреждения API (${warnings.length}), операция выполнена с оговорками:\n` +
+        warnings.map((w) => `- ${w}`).join("\n"),
+    );
+  }
+  if (blocks.length === 0) return { content: [{ type: "text", text: body }] };
+  const text = `${blocks.join("\n\n")}\n\n${body}`;
+  const out: CallToolResult = { content: [{ type: "text", text }] };
+  if (failed > 0) out.isError = true;
+  return out;
+}
+
+/** Methods that only read data and never mutate the account (get/has/check). */
+export function isReadMethod(method: string): boolean {
+  return /^(get|has|check)/i.test(method);
+}
+
+/** Also notes the failure's origin for telemetry (noteFailure). */
+export function fail(err: unknown): CallToolResult {
+  return noteFailure(failText(err), err);
+}
+
+function failText(err: unknown): CallToolResult {
+  let message: string;
+  if (err instanceof YandexDirectError || err instanceof Error) {
+    message = err.message;
+    // Node's fetch wraps the real network error in `cause` (the top-level message is
+    // just "fetch failed") — without it the model has nothing actionable to react to.
+    const cause = (err as { cause?: unknown }).cause;
+    if (cause instanceof Error && cause.message && !message.includes(cause.message)) {
+      message += ` (причина: ${cause.message})`;
+    }
+  } else {
+    message = String(err);
+  }
+  return { content: [{ type: "text", text: `Ошибка: ${message}` }], isError: true };
+}
+
+/** Converts an amount in account currency units to micros (1 unit = 1_000_000 micros). */
+export function toMicros(amount: number): number {
+  return Math.round(amount * 1_000_000);
+}
+
+/** Converts micros back to account currency units (1_000_000 micros = 1 unit). */
+export function fromMicros(micros: number): number {
+  return micros / 1_000_000;
+}
+
+/**
+ * Money fields the JSON services always return in micros. The Reports service
+ * (statistics) already returns currency units, and inputs are taken in units,
+ * so list_* output is normalized here to keep money consistent across tools.
+ *
+ * Bid/ContextBid (keyword bids) and the shared-account Funds money keys —
+ * Sum/Balance/SumAvailableForTransfer (CampaignFunds) and Spend
+ * (SharedAccountFunds) — are all in micros. These Funds keys are money-only
+ * in the Direct schema, so recursive normalization does not touch same-named
+ * non-money fields. Deprecated keys (BalanceBonus, Refund, DailyBudget.Amount)
+ * are intentionally omitted rather than risk converting a value the API no
+ * longer maintains. Strategy money (WeeklySpendLimit, …) has its own set in
+ * strategy.ts.
+ */
+const MONEY_FIELDS = new Set([
+  "Bid",
+  "ContextBid",
+  "Sum",
+  "Balance",
+  "SumAvailableForTransfer",
+  "Spend",
+]);
+
+/** Recursively converts known money fields from micros to currency units, in place. */
+export function normalizeMoney<T>(value: T, fields: Set<string> = MONEY_FIELDS): T {
+  if (Array.isArray(value)) {
+    for (const item of value) normalizeMoney(item, fields);
+  } else if (value && typeof value === "object") {
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      if (fields.has(key) && typeof val === "number") {
+        (value as Record<string, unknown>)[key] = fromMicros(val);
+      } else {
+        normalizeMoney(val, fields);
+      }
+    }
+  }
+  return value;
+}
+
+/** Largest page size the get services accept; used as the default per-page limit. */
+export const DEFAULT_PAGE_LIMIT = 10000;
+
+/**
+ * Cap on the `limit` a list_* tool exposes to the caller. The API allows up to
+ * 10000/page, but a single 10k-row result blows up the LLM context, so the tools
+ * advertise a much smaller ceiling. autoPaginate (multi-page) is bounded
+ * separately by getAll's maxPages.
+ */
+export const MAX_TOOL_LIMIT = 1000;
+
+/**
+ * Builds a Page object for a get request. The API requires Limit whenever Page
+ * is present, so Limit defaults to DEFAULT_PAGE_LIMIT when only an offset is given.
+ * Returns undefined when neither limit nor offset is requested.
+ */
+export function buildPage(
+  limit?: number,
+  offset?: number,
+): { Limit: number; Offset: number } | undefined {
+  if (limit === undefined && offset === undefined) return undefined;
+  return { Limit: limit ?? DEFAULT_PAGE_LIMIT, Offset: offset ?? 0 };
+}
+
+/**
+ * ads/keywords/adgroups.get reject a SelectionCriteria without an id list (code 4001) —
+ * answer before the request, naming the ids to pass and where to get them.
+ */
+export const NO_SELECTION = (params: string): string =>
+  `Нужен хотя бы один фильтр: ${params}. API Яндекс Директа не отдаёт эти объекты по всему аккаунту — ` +
+  "сначала получить id кампаний через list_campaigns и передать их в campaignIds (не больше 10 за вызов).";
+
+/**
+ * ArrayOfString value for a nillable list field (NegativeKeywords, ExcludedSites).
+ * The API rejects `{Items: []}` (code 8000, "не менее 1 элемента" — checked live),
+ * so an empty list is sent as `null`, the documented way to clear the field.
+ */
+export function stringList(items: string[] | undefined): { Items: string[] } | null | undefined {
+  if (items === undefined) return undefined;
+  return items.length === 0 ? null : { Items: items };
+}
+
+/** Drops keys whose value is `undefined` so they are not sent to the API. */
+export function compact<T extends Record<string, unknown>>(obj: T): T {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, v]) => v !== undefined),
+  ) as T;
+}
+
+/**
+ * MCP tool annotations — hints the consuming client can use to gate or label a
+ * tool (e.g. auto-approve reads, warn before writes). Every tool here talks to
+ * the remote Yandex Direct API, so openWorldHint is always true.
+ *
+ *   READ_ONLY    — get/list tools; never mutate the account.
+ *   WRITE_CREATE — add/create/upload tools; introduce new objects.
+ *   WRITE_UPDATE — update/set tools; re-applying the same input is idempotent.
+ *   WRITE_DELETE — delete and lifecycle *_action tools; can remove or archive objects.
+ */
+// All four hints set explicitly: some clients (OpenAI Apps review) require readOnlyHint,
+// destructiveHint and openWorldHint on every tool. Read-only tools never mutate, so they
+// are non-destructive and idempotent (re-reading yields the same result).
+export const READ_ONLY = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true,
+} as const;
+export const WRITE_CREATE = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+} as const;
+export const WRITE_UPDATE = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true,
+} as const;
+export const WRITE_DELETE = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+} as const;

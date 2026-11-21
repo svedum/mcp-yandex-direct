@@ -1,0 +1,59 @@
+import type { YandexDirectConfig } from "./types.js";
+
+/**
+ * A malformed environment variable. Thrown instead of exiting on the spot so
+ * index.ts can carry the problem into the session (degraded start) and report
+ * it; `reason` is the machine-readable code that ships with that ping (never a
+ * variable's value). A *missing* variable is NOT a ConfigError — see loadConfig.
+ */
+export class ConfigError extends Error {
+  readonly reason: string;
+
+  constructor(message: string, reason: string) {
+    super(message);
+    this.name = "ConfigError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Builds the client config from environment variables.
+ *
+ * A missing YANDEX_DIRECT_TOKEN is NOT an error here: the server starts anyway
+ * and the token is resolved per request (env → stored credentials, see
+ * TokenStore in auth.ts), so an unconfigured install completes the MCP
+ * handshake and surfaces the connection hint in instructions — instead of dying
+ * before `initialize` and leaving a silent red cross. The env variable stays
+ * as the alternative: set it and restart the server.
+ *
+ * The optional variables (LOGIN, CLIENTS, LANG, SANDBOX, TIMEOUT_MS, MAX_RETRIES) are
+ * lenient by design — an unparsable value falls back to its default, so
+ * ConfigError has no live throw site today; index.ts still guards future
+ * malformed-value checks with loadConfigOrDegraded.
+ */
+export function loadConfig(): YandexDirectConfig {
+  const timeoutMs = Number(process.env.YANDEX_DIRECT_TIMEOUT_MS);
+  const maxRetries = Number(process.env.YANDEX_DIRECT_MAX_RETRIES);
+  return {
+    // An empty string reads as absent, never as an empty credential.
+    token: process.env.YANDEX_DIRECT_TOKEN || undefined,
+    login: process.env.YANDEX_DIRECT_LOGIN || undefined,
+    clients: parseLogins(process.env.YANDEX_DIRECT_CLIENTS),
+    lang: process.env.YANDEX_DIRECT_LANG || "ru",
+    sandbox: /^(1|true|yes)$/i.test(process.env.YANDEX_DIRECT_SANDBOX ?? ""),
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 60_000,
+    maxRetries: Number.isFinite(maxRetries) && maxRetries >= 0 ? maxRetries : 3,
+  };
+}
+
+/** "a, b c" → ["a", "b", "c"]: commas or whitespace, duplicates dropped (case-insensitive). */
+export function parseLogins(value: string | undefined): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const login of (value ?? "").split(/[\s,;]+/)) {
+    if (!login || seen.has(login.toLowerCase())) continue;
+    seen.add(login.toLowerCase());
+    out.push(login);
+  }
+  return out;
+}

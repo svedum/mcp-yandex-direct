@@ -1,0 +1,39 @@
+name: Demo account e2e
+
+# Read + write round-trip against the production API on the dedicated demo account
+# askads-demo (empty, unfunded): src/integration.ts refuses to write unless clients.get
+# answers with E2E_ACCOUNT_LOGIN, creates a draft campaign of each type and deletes it. Runs on
+# push to main and daily; never on pull_request, so the token secret is not exposed
+# to PRs or forks.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One account, one run at a time: a second run (any trigger, any ref) waits instead of
+# racing the first one's cleanup and campaign.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    if: github.repository == 'askads/mcp-yandex-direct'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20.x
+          cache: npm
+      - run: npm ci
+      - name: E2E check on askads-demo (reads + create/read/delete of draft campaigns)
+        run: npm run integration
+        env:
+          E2E_ACCOUNT_LOGIN: askads-demo
+          YANDEX_DIRECT_TOKEN: ${{ secrets.YANDEX_DIRECT_DEMO_TOKEN }}

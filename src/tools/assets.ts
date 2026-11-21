@@ -1,0 +1,174 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import type { YandexDirectClient } from "../client.js";
+import { buildPage, compact, fail, MAX_TOOL_LIMIT, ok, okOrPartial, READ_ONLY, WRITE_CREATE, WRITE_DELETE } from "./util.js";
+
+export function registerAssetTools(server: McpServer, client: YandexDirectClient): void {
+  server.registerTool(
+    "get_sitelinks",
+    {
+      title: "Наборы быстрых ссылок",
+      annotations: READ_ONLY,
+      description:
+        "Читает наборы быстрых ссылок по id. API требует id наборов — их можно взять из поля SitelinkSetId объявлений.",
+      inputSchema: {
+        ids: z.array(z.number().int()).min(1).describe("Id наборов быстрых ссылок (обязательны по требованию API)."),
+        limit: z.number().int().min(1).max(MAX_TOOL_LIMIT).optional().describe("Максимум объектов на страницу."),
+        offset: z.number().int().min(0).optional().describe("Смещение постраничной выдачи."),
+      },
+    },
+    async ({ ids, limit, offset }) => {
+      try {
+        const params: Record<string, unknown> = {
+          SelectionCriteria: { Ids: ids },
+          FieldNames: ["Id"],
+          SitelinkFieldNames: ["Title", "Href", "Description", "TurboPageId"],
+        };
+        const page = buildPage(limit, offset);
+        if (page) params.Page = page;
+        const result = await client.call("sitelinks", "get", params);
+        return ok(result);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "create_sitelinks_set",
+    {
+      title: "Создать набор быстрых ссылок",
+      annotations: WRITE_CREATE,
+      description:
+        "Создаёт набор быстрых ссылок (1–8 штук). Лимиты API: текст ссылки до 30 символов, описание до 60, URL до 1024 (с протоколом и доменом); длиннее API отвечает «Превышена допустимая длина», поэтому сокращать заранее. Наборы неизменяемы — чтобы поменять ссылки, нужно создать новый набор и переназначить его объявлению.",
+      inputSchema: {
+        sitelinks: z
+          .array(
+            z.object({
+              title: z.string().min(1).max(30).describe("Текст быстрой ссылки, до 30 символов."),
+              href: z.string().max(1024).optional().describe("URL быстрой ссылки с протоколом и доменом, до 1024 символов."),
+              description: z
+                .string()
+                .max(60)
+                .optional()
+                .describe("Описание быстрой ссылки, до 60 символов (показывается в расширенном формате объявления)."),
+            }),
+          )
+          .min(1)
+          .max(8)
+          .describe("От 1 до 8 быстрых ссылок."),
+      },
+    },
+    async ({ sitelinks }) => {
+      try {
+        const set = {
+          Sitelinks: sitelinks.map((s) =>
+            compact({ Title: s.title, Href: s.href, Description: s.description }),
+          ),
+        };
+        const result = await client.call("sitelinks", "add", { SitelinksSets: [set] });
+        return okOrPartial(result);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_sitelinks",
+    {
+      title: "Удалить наборы быстрых ссылок",
+      annotations: WRITE_DELETE,
+      description: "Удаляет наборы быстрых ссылок по id (удалить можно только наборы, не привязанные ни к одному объявлению).",
+      inputSchema: {
+        ids: z.array(z.number().int()).min(1).describe("Id наборов, которые нужно удалить."),
+      },
+    },
+    async ({ ids }) => {
+      try {
+        const result = await client.call("sitelinks", "delete", { SelectionCriteria: { Ids: ids } });
+        return okOrPartial(result);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_callouts",
+    {
+      title: "Уточнения",
+      annotations: READ_ONLY,
+      description:
+        "Возвращает список уточнений из библиотеки adextensions. Привязать уточнение к объявлению можно через сервис Ads.",
+      inputSchema: {
+        ids: z.array(z.number().int()).optional().describe("Фильтр по id уточнений."),
+        limit: z.number().int().min(1).max(MAX_TOOL_LIMIT).optional().describe("Максимум объектов на страницу."),
+        offset: z.number().int().min(0).optional().describe("Смещение постраничной выдачи."),
+      },
+    },
+    async ({ ids, limit, offset }) => {
+      try {
+        const params: Record<string, unknown> = {
+          SelectionCriteria: compact({ Ids: ids?.length ? ids : undefined, Types: ["CALLOUT"] }),
+          FieldNames: ["Id", "Type", "Status", "StatusClarification", "Associated"],
+          CalloutFieldNames: ["CalloutText"],
+        };
+        const page = buildPage(limit, offset);
+        if (page) params.Page = page;
+        const result = await client.call("adextensions", "get", params);
+        return ok(result);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "add_callouts",
+    {
+      title: "Добавить уточнения",
+      annotations: WRITE_CREATE,
+      description:
+        "Создаёт уточнения, до 25 символов каждое, не более 1000 за вызов. Уточнения неизменяемы — чтобы поменять, нужно удалить и создать заново. Привязка к объявлениям — через сервис Ads.",
+      inputSchema: {
+        texts: z
+          .array(z.string().min(1).max(25))
+          .min(1)
+          .max(1000)
+          .describe("Тексты уточнений, до 25 символов каждый, не более 1000 за вызов."),
+      },
+    },
+    async ({ texts }) => {
+      try {
+        const adExtensions = texts.map((text) => ({ Callout: { CalloutText: text } }));
+        const result = await client.call("adextensions", "add", { AdExtensions: adExtensions });
+        return okOrPartial(result);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_callouts",
+    {
+      title: "Удалить уточнения",
+      annotations: WRITE_DELETE,
+      description: "Удаляет уточнения по id (adextensions/delete).",
+      inputSchema: {
+        ids: z.array(z.number().int()).min(1).describe("Id уточнений, которые нужно удалить."),
+      },
+    },
+    async ({ ids }) => {
+      try {
+        const result = await client.call("adextensions", "delete", {
+          SelectionCriteria: { Ids: ids },
+        });
+        return okOrPartial(result);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+}

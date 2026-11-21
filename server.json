@@ -1,0 +1,53 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.askads/mcp-yandex-direct",
+  "title": "Yandex Direct MCP",
+  "description": "MCP server for Yandex Direct API v5: manage PPC campaigns, ads, keywords, and statistics.",
+  "websiteUrl": "https://github.com/askads/mcp-yandex-direct#readme",
+  "repository": {
+    "url": "https://github.com/askads/mcp-yandex-direct",
+    "source": "github"
+  },
+  "version": "1.14.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "mcp-yandex-direct",
+      "version": "1.14.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "YANDEX_DIRECT_TOKEN",
+          "description": "Yandex Direct OAuth token — full account access (can spend budget). Treat it as a secret.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "YANDEX_DIRECT_LOGIN",
+          "description": "Default client login on agency tokens; any tool can override it with client_login.",
+          "isRequired": false
+        },
+        {
+          "name": "YANDEX_DIRECT_CLIENTS",
+          "description": "Comma-separated logins of managed (non-agency) accounts, shown by list_clients.",
+          "isRequired": false
+        },
+        {
+          "name": "YANDEX_DIRECT_SANDBOX",
+          "description": "Set to true to call the Yandex Direct sandbox API instead of production.",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "YANDEX_DIRECT_LANG",
+          "description": "Language for API responses and error messages (ru, en, ...).",
+          "isRequired": false,
+          "default": "ru"
+        }
+      ]
+    }
+  ]
+}

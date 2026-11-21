@@ -1,0 +1,239 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { registerKeywordTools } from "./keywords.js";
+import { registerCampaignTools } from "./campaigns.js";
+import { registerAdGroupTools } from "./adGroups.js";
+import { registerAdTools } from "./ads.js";
+
+type Args = Record<string, unknown>;
+type Handler = (args: Args) => Promise<{ content: { text: string }[]; isError?: boolean }>;
+interface RecordedCall {
+  service: string;
+  method: string;
+  params: Record<string, any>;
+}
+
+/** Registers tools against a fake server with a mock client so handlers run without network. */
+function harness(register: (server: any, client: any) => void, opts: { getResult?: unknown } = {}) {
+  const calls: RecordedCall[] = [];
+  const tools: Record<string, Handler> = {};
+  const client = {
+    call: async (service: string, method: string, params: Record<string, unknown>) => {
+      calls.push({ service, method, params });
+      if (method === "get") return opts.getResult ?? {};
+      const key = `${method[0].toUpperCase()}${method.slice(1)}Results`;
+      return { [key]: [{ Id: 1 }] };
+    },
+  };
+  const server = {
+    registerTool: (name: string, _cfg: unknown, handler: Handler) => {
+      tools[name] = handler;
+    },
+  };
+  register(server, client);
+  return { calls, tools };
+}
+
+test("set_keyword_bids converts bids to micros and calls keywordbids/set", async () => {
+  const { calls, tools } = harness(registerKeywordTools);
+  const res = await tools.set_keyword_bids({ bids: [{ keywordId: 5, bid: 1.5, contextBid: 2 }] });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls[0].service, "keywordbids");
+  assert.equal(calls[0].method, "set");
+  assert.deepEqual(calls[0].params.KeywordBids[0], {
+    KeywordId: 5,
+    SearchBid: 1_500_000,
+    NetworkBid: 2_000_000,
+  });
+});
+
+test("set_keyword_bids sends SearchBid/NetworkBid, never Bid/ContextBid (API code 8000)", async () => {
+  const { calls, tools } = harness(registerKeywordTools);
+  await tools.set_keyword_bids({ bids: [{ adGroupId: 9, bid: 3 }, { adGroupId: 10, contextBid: 4 }] });
+  const [search, network] = calls[0].params.KeywordBids;
+  assert.deepEqual(search, { AdGroupId: 9, SearchBid: 3_000_000 });
+  assert.deepEqual(network, { AdGroupId: 10, NetworkBid: 4_000_000 });
+  for (const item of calls[0].params.KeywordBids) {
+    assert.equal("Bid" in item, false);
+    assert.equal("ContextBid" in item, false);
+  }
+});
+
+test("set_keyword_bids rejects an item with no target id and makes no call", async () => {
+  const { calls, tools } = harness(registerKeywordTools);
+  const res = await tools.set_keyword_bids({ bids: [{ bid: 1 }] });
+  assert.equal(res.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("set_keyword_bids rejects an item with no bid", async () => {
+  const { calls, tools } = harness(registerKeywordTools);
+  const res = await tools.set_keyword_bids({ bids: [{ keywordId: 5 }] });
+  assert.equal(res.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("set_keyword_bids rejects mixed target types and makes no call", async () => {
+  const { calls, tools } = harness(registerKeywordTools);
+  const res = await tools.set_keyword_bids({ bids: [{ keywordId: 5, bid: 1 }, { adGroupId: 9, bid: 2 }] });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /нельзя смешивать типы целей/);
+  assert.equal(calls.length, 0);
+});
+
+test("set_keyword_bids rejects an item with two target ids and makes no call", async () => {
+  const { calls, tools } = harness(registerKeywordTools);
+  const res = await tools.set_keyword_bids({ bids: [{ keywordId: 5, campaignId: 3, bid: 1 }] });
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /ровно один целевой id/);
+  assert.equal(calls.length, 0);
+});
+
+for (const [field, apiField] of [
+  ["keywordId", "KeywordId"],
+  ["adGroupId", "AdGroupId"],
+  ["campaignId", "CampaignId"],
+] as const) {
+  test(`set_keyword_bids accepts a homogeneous ${field} array`, async () => {
+    const { calls, tools } = harness(registerKeywordTools);
+    const res = await tools.set_keyword_bids({ bids: [{ [field]: 1, bid: 1 }, { [field]: 2, contextBid: 2 }] });
+    assert.equal(res.isError, undefined);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(
+      calls[0].params.KeywordBids.map((b: Record<string, unknown>) => b[apiField]),
+      [1, 2],
+    );
+  });
+}
+
+test("update_campaign sends only provided fields in a single update, no read first", async () => {
+  const { calls, tools } = harness(registerCampaignTools);
+  const res = await tools.update_campaign({ id: 7, name: "New", endDate: "2026-12-31" });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "update");
+  assert.deepEqual(calls[0].params.Campaigns[0], { Id: 7, Name: "New", EndDate: "2026-12-31" });
+});
+
+test("update_campaign refuses the retired daily budget before any call (Yandex drops it 2026-11-30)", async () => {
+  // Silently dropping the parameter would rename the campaign and report success without
+  // touching the budget — the caller must learn where the budget lives now.
+  for (const args of [{ dailyBudgetAmount: 100 }, { dailyBudgetMode: "DISTRIBUTED" }]) {
+    const { calls, tools } = harness(registerCampaignTools);
+    const res = await tools.update_campaign({ id: 7, name: "New", ...args });
+    assert.equal(res.isError, true, JSON.stringify(args));
+    assert.match(res.content[0].text, /set_campaign_strategy/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("update_campaign rejects an empty update and makes no call", async () => {
+  const { calls, tools } = harness(registerCampaignTools);
+  const res = await tools.update_campaign({ id: 7 });
+  assert.equal(res.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("update_ad_group updates regions via adgroups/update", async () => {
+  const { calls, tools } = harness(registerAdGroupTools);
+  const res = await tools.update_ad_group({ id: 9, regionIds: [225] });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls[0].method, "update");
+  assert.deepEqual(calls[0].params.AdGroups[0], { Id: 9, RegionIds: [225] });
+});
+
+test("update_campaign sets negative keywords as NegativeKeywords.Items", async () => {
+  const { calls, tools } = harness(registerCampaignTools);
+  const res = await tools.update_campaign({ id: 7, negativeKeywords: ["free", "download"] });
+  assert.equal(res.isError, undefined);
+  assert.deepEqual(calls[0].params.Campaigns[0], {
+    Id: 7,
+    NegativeKeywords: { Items: ["free", "download"] },
+  });
+});
+
+// The API rejects {Items: []} with code 8000 ("не менее 1 элемента", checked live);
+// null is the documented way to clear a nillable list.
+test("update_ad_group clears negative keywords with null, never an empty Items", async () => {
+  const { calls, tools } = harness(registerAdGroupTools);
+  const res = await tools.update_ad_group({ id: 9, negativeKeywords: [] });
+  assert.equal(res.isError, undefined);
+  assert.deepEqual(calls[0].params.AdGroups[0], { Id: 9, NegativeKeywords: null });
+});
+
+test("update_campaign clears negative keywords with null, never an empty Items", async () => {
+  const { calls, tools } = harness(registerCampaignTools);
+  const res = await tools.update_campaign({ id: 7, negativeKeywords: [] });
+  assert.equal(res.isError, undefined);
+  assert.deepEqual(calls[0].params.Campaigns[0], { Id: 7, NegativeKeywords: null });
+});
+
+test("create_text_ad always sends the required Mobile flag", async () => {
+  // TextAdAdd requires Mobile (deprecated, coerced to NO by the API) — dropping the
+  // unset field used to make ads/add fail per-object on every default call.
+  const { calls, tools } = harness(registerAdTools);
+  const res = await tools.create_text_ad({
+    adGroupId: 5,
+    title: "T",
+    text: "X",
+    href: "https://example.com",
+  });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls[0].method, "add");
+  assert.deepEqual(calls[0].params.Ads[0], {
+    AdGroupId: 5,
+    TextAd: { Title: "T", Text: "X", Href: "https://example.com", Mobile: "NO" },
+  });
+});
+
+test("create_text_ad maps mobile:true to Mobile YES", async () => {
+  const { calls, tools } = harness(registerAdTools);
+  await tools.create_text_ad({
+    adGroupId: 5,
+    title: "T",
+    text: "X",
+    href: "https://example.com",
+    mobile: true,
+  });
+  assert.equal(calls[0].params.Ads[0].TextAd.Mobile, "YES");
+});
+
+test("update_text_ad updates only provided fields", async () => {
+  const { calls, tools } = harness(registerAdTools);
+  const res = await tools.update_text_ad({ id: 3, title: "Hi" });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls[0].method, "update");
+  assert.deepEqual(calls[0].params.Ads[0], { Id: 3, TextAd: { Title: "Hi" } });
+});
+
+test("update_text_ad rejects an empty update", async () => {
+  const { calls, tools } = harness(registerAdTools);
+  const res = await tools.update_text_ad({ id: 3 });
+  assert.equal(res.isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test("delete_ad_groups calls adgroups/delete with the ids", async () => {
+  const { calls, tools } = harness(registerAdGroupTools);
+  const res = await tools.delete_ad_groups({ ids: [9, 10] });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls[0].service, "adgroups");
+  assert.equal(calls[0].method, "delete");
+  assert.deepEqual(calls[0].params, { SelectionCriteria: { Ids: [9, 10] } });
+});
+
+// Ads added since Direct made them комбинаторные have 64-bit ids; they travel as strings.
+test("update_text_ad sends a long id as the string it was given", async () => {
+  const { calls, tools } = harness(registerAdTools);
+  const res = await tools.update_text_ad({ id: "1926766869946816190", title: "Hi" });
+  assert.equal(res.isError, undefined);
+  assert.deepEqual(calls[0].params.Ads[0], { Id: "1926766869946816190", TextAd: { Title: "Hi" } });
+});
+
+test("ad_action sends long ids as strings next to ordinary numbers", async () => {
+  const { calls, tools } = harness(registerAdTools);
+  const res = await tools.ad_action({ action: "suspend", ids: ["1926766869946816190", 17674525094] });
+  assert.equal(res.isError, undefined);
+  assert.equal(calls[0].method, "suspend");
+  assert.deepEqual(calls[0].params, { SelectionCriteria: { Ids: ["1926766869946816190", 17674525094] } });
+});
